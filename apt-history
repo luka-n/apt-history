@@ -1,0 +1,120 @@
+#!/usr/bin/env perl
+
+use v5.20.0;
+
+use warnings;
+
+no warnings qw(experimental::postderef
+               experimental::signatures
+               experimental::smartmatch);
+
+use feature qw(postderef signatures);
+
+use Getopt::Long;
+use IO::Uncompress::Gunzip;
+use Time::Piece;
+
+my $all = 0;
+my $help = 0;
+my $limit = 10;
+
+my $rowfmt = "%-4s  %-16s  %-12s  %-8s  %s\n";
+
+my @actions = qw(Install Purge Remove Upgrade Reinstall);
+my @histories = ();
+
+sub usage {
+  print <<EOS;
+Usage: apt-history [options] command
+       apt-history [options] show [id ...]
+
+Commands:
+   list - List recent actions from apt's history.log
+   show - Show details on a line of history
+
+Options:
+  -h   This help text.
+  -a   List all items in table, don't limit it
+  -l=? Set limit on number of table rows listed
+EOS
+  exit 0;
+}
+
+sub parse {
+  my ($id, @histories) = 0, ();
+  for my $log (reverse(</var/log/apt/history.log*>)) {
+    my $class = $log =~ /\.gz$/ ? "IO::Uncompress::Gunzip" : "IO::File";
+    my $io = $class->new($log);
+    my $data = do { local $/; <$io>; };
+    $io->close;
+    for my $chunk (split("\n\n", $data)) {
+      my %history = map { split /: /, $_, 2 } split "\n", $chunk;
+      $history{"Start-Date"} = Time::Piece->
+        strptime($history{"Start-Date"}, "%Y-%m-%d  %H:%M:%S");
+      $history{"End-Date"} = Time::Piece->
+        strptime($history{"End-Date"}, "%Y-%m-%d  %H:%M:%S");
+      $history{Actions} = {};
+      for my $action (grep { $history{$_} } @actions) {
+        $history{Actions}{$action} =
+          [split /(?![^\(]+\)), /, delete $history{$action}];
+      }
+      $history{Id} = $id++;
+      push @histories, \%history;
+    }
+  }
+  reverse @histories;
+}
+
+sub print_history_header {
+  printf $rowfmt, "Id", "Start date", "Action(s)", "Altered", "Command line";
+}
+
+sub print_history ($history, $header=1) {
+  print_history_header if $header;
+  my $actions = join ", ", keys $$history{Actions}->%*;
+  $actions =~ s/(\w)\w+/$1/g if $actions =~ /, /;
+  my $altereds = 0;
+  for my $action (keys $$history{Actions}->%*) {
+    $altereds += scalar $$history{Actions}{$action}->@*;
+  }
+  printf $rowfmt,
+    $$history{Id},
+    $$history{"Start-Date"}->strftime("%a %b %d %H:%M"),
+    $actions,
+    $altereds,
+    $$history{Commandline} ? $$history{Commandline} =~ s/^\S+ //r : "";
+}
+
+sub print_extended_history ($history) {
+  print "          Id: $$history{Id}\n";
+  print "  Start date: $$history{'Start-Date'}\n";
+  print "    End date: $$history{'End-Date'}\n";
+  print "Command line: $$history{Commandline}\n" if $$history{Commandline};
+  for my $action (keys $$history{Actions}->%*) {
+    printf "%12s: %s\n", $action, join "\n              ",
+      $$history{Actions}{$action}->@*;
+  }
+}
+
+sub list {
+  for my $idx ($all ? 0..$#histories : 0..$limit) {
+    print_history $histories[$idx], !$idx;
+  }
+}
+
+sub show (@ids) {
+  for my $history (grep { !@ids || $$_{Id} ~~ @ids } @histories) {
+    print_extended_history $history;
+  }
+}
+
+GetOptions("all",     \$all,
+           "help",    \$help,
+           "limit=i", \$limit) || exit 1;
+
+@histories = parse;
+
+if    (!@ARGV)             { usage; }
+elsif ($ARGV[0] eq "list") { list; }
+elsif ($ARGV[0] eq "show") { show splice @ARGV, 1; }
+elsif (!!@ARGV)            { die "Unknown command: $ARGV[0]\n"; }
